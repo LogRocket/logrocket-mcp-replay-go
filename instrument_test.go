@@ -267,6 +267,54 @@ func TestGetUserEmptyIDIsDropped(t *testing.T) {
 	}
 }
 
+func TestGetSessionID(t *testing.T) {
+	ingest := startIngest(t)
+	server := newDemoServer()
+	opts := ingest.options(t)
+	opts.GetSessionID = func(_ context.Context, req mcp.Request) string {
+		if call, ok := req.(*mcp.CallToolRequest); ok {
+			return "conversation-" + call.Params.Name
+		}
+		return ""
+	}
+	recorder := Instrument(server, opts)
+
+	session := connect(t, server)
+	callAdd(t, session)
+	shutdown(t, recorder)
+
+	for _, event := range ingest.events() {
+		want := ""
+		if event.Method == "tools/call" {
+			want = "conversation-add"
+		}
+		if event.SessionID != want {
+			t.Errorf("%s sessionID = %q, want %q", event.Method, event.SessionID, want)
+		}
+	}
+}
+
+func TestGetSessionIDPanicIsContained(t *testing.T) {
+	ingest := startIngest(t)
+	server := newDemoServer()
+	var errs []error
+	opts := ingest.options(t)
+	opts.OnError = func(err error) { errs = append(errs, err) }
+	opts.GetSessionID = func(context.Context, mcp.Request) string { panic("boom") }
+	recorder := Instrument(server, opts)
+
+	session := connect(t, server)
+	callAdd(t, session)
+	shutdown(t, recorder)
+
+	if call := findEvent(t, ingest.events(), byMethod("tools/call")); call.SessionID != "" {
+		t.Errorf("sessionID = %q", call.SessionID)
+	}
+	if len(errs) == 0 || !strings.Contains(errs[0].Error(), "GetSessionID panicked") {
+		t.Errorf("errors = %v", errs)
+	}
+}
+
 type headerRoundTripper struct {
 	headers map[string]string
 }

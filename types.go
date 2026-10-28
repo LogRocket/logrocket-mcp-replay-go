@@ -81,7 +81,12 @@ type RequestEvent struct {
 	// process). Last-resort sessionization key for transports with no HTTP
 	// context where one process serves one user (e.g., stdio).
 	InstanceID string `json:"instanceID,omitempty"`
-	Seq        int64  `json:"seq"`
+	// SessionID is an app-defined ID (e.g., a conversation ID) that splits
+	// requests from the same user and client into separate LogRocket
+	// sessions. It never merges requests the identity signals above would
+	// separate. Sessions still end after 30 minutes of inactivity.
+	SessionID string `json:"sessionID,omitempty"`
+	Seq       int64  `json:"seq"`
 }
 
 // SDKInfo identifies the SDK that produced a batch.
@@ -144,6 +149,10 @@ type Options struct {
 	// carries the HTTP headers and validated bearer token info on HTTP
 	// transports (nil on stdio). Used by Instrument only.
 	GetUser func(ctx context.Context, req mcp.Request) *RecordedUser
+	// GetSessionID resolves an app-defined session ID (e.g., a conversation
+	// ID) for a request; see RequestEvent.SessionID. Return "" to fall back
+	// to the default grouping. Used by Instrument only.
+	GetSessionID func(ctx context.Context, req mcp.Request) string
 }
 
 const (

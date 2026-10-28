@@ -4,5 +4,5 @@ package mcpreplay
 // SDKVersion must match the module's release tag (without the leading v).
 const (
 	SDKName    = "logrocket-mcp-replay-go"
-	SDKVersion = "0.1.0"
+	SDKVersion = "0.2.0"
 )

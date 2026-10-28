@@ -198,6 +198,99 @@ func TestInvalidAPIKeyDisablesRecording(t *testing.T) {
 	}
 }
 
+func TestEnqueueAppliesOptions(t *testing.T) {
+	ingest := startIngest(t)
+	var errs []error
+	recorder := NewRecorder(Options{
+		APIKey:               testAPIKey,
+		ServerURL:            ingest.URL,
+		DisableResultCapture: true,
+		RedactHeaders:        []string{"X-Customer-ID"},
+		MaxValueLength:       20,
+		SanitizeEvent: func(event *RequestEvent) *RequestEvent {
+			if event.Target == "secret" {
+				return nil
+			}
+			return event
+		},
+		OnError: func(err error) { errs = append(errs, err) },
+	})
+
+	recorder.Enqueue(&RequestEvent{
+		StartTime:  1,
+		DurationMs: -5,
+		Method:     "tools/call",
+		Target:     "search",
+		Params:     map[string]any{"query": strings.Repeat("q", 100)},
+		Result:     &RecordedResult{IsError: true, Value: "rows"},
+		Headers:    map[string]string{"Authorization": "Bearer abc", "X-Customer-ID": "42", "Accept": "application/json"},
+		User:       &RecordedUser{Email: "a@example.com"},
+		SessionID:  "conversation-1",
+		Seq:        99,
+	})
+	recorder.Enqueue(&RequestEvent{StartTime: 1, Method: "tools/call", Target: "secret"})
+	recorder.Enqueue(&RequestEvent{StartTime: 1})
+	shutdown(t, recorder)
+
+	events := ingest.events()
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1: %s", len(events), mustJSON(t, events))
+	}
+	event := events[0]
+	if event.Type != "mcp.request" || event.InstanceID != recorder.InstanceID() || event.Seq != 1 || event.DurationMs != 0 {
+		t.Errorf("stamped fields = %s", mustJSON(t, event))
+	}
+	if params, ok := event.Params.(string); !ok || !strings.HasSuffix(params, TruncatedMarker) {
+		t.Errorf("params = %s", mustJSON(t, event.Params))
+	}
+	if got := mustJSON(t, event.Result); got != `{"isError":true}` {
+		t.Errorf("result = %s", got)
+	}
+	wantHeaders := `{"accept":"application/json","authorization":"[REDACTED]","x-customer-id":"[REDACTED]"}`
+	if got := mustJSON(t, event.Headers); got != wantHeaders {
+		t.Errorf("headers = %s, want %s", got, wantHeaders)
+	}
+	if event.User != nil || event.SessionID != "conversation-1" {
+		t.Errorf("event = %s", mustJSON(t, event))
+	}
+	if len(errs) != 2 || !strings.Contains(errs[0].Error(), "empty ID") || !strings.Contains(errs[1].Error(), "without a Method") {
+		t.Errorf("errors = %v", errs)
+	}
+}
+
+func TestEnqueueDisableParamAndHeaderCapture(t *testing.T) {
+	ingest := startIngest(t)
+	recorder := NewRecorder(Options{APIKey: testAPIKey, ServerURL: ingest.URL, DisableParamCapture: true, DisableHeaderCapture: true})
+
+	recorder.Enqueue(&RequestEvent{
+		StartTime: 1,
+		Method:    "tools/call",
+		Params:    map[string]any{"account": "123"},
+		Result:    &RecordedResult{Value: "ok"},
+		Headers:   map[string]string{"Accept": "application/json"},
+	})
+	shutdown(t, recorder)
+
+	event := ingest.events()[0]
+	if event.Params != nil || event.Headers != nil || mustJSON(t, event.Result) != `{"value":"ok"}` {
+		t.Errorf("event = %s", mustJSON(t, event))
+	}
+}
+
+func TestShutdownIsRepeatable(t *testing.T) {
+	ingest := startIngest(t)
+	recorder := NewRecorder(Options{APIKey: testAPIKey, ServerURL: ingest.URL})
+
+	for range 2 {
+		recorder.Enqueue(makeEvent(0))
+		shutdown(t, recorder)
+	}
+
+	if len(ingest.batches()) != 2 {
+		t.Fatalf("got %d batches, want 2", len(ingest.batches()))
+	}
+}
+
 func TestShutdownHonorsContextDeadline(t *testing.T) {
 	ingest := startIngest(t)
 	ingest.delay[1] = 500 * time.Millisecond

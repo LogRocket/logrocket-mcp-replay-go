@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/http"
 	"runtime"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -42,6 +41,7 @@ const (
 	maxTracestateLength      = 1024
 	maxBaggageLength         = 8192
 	maxOAuthClientIDLength   = 512
+	maxSessionIDLength       = 256
 )
 
 var alwaysRedactedHeaders = map[string]bool{
@@ -187,8 +187,8 @@ func record(
 		}
 	}()
 
-	if event := buildEvent(ctx, recorder, opts, method, req, start, result, err); event != nil {
-		recorder.Enqueue(event)
+	if event := recorder.prepare(buildEvent(ctx, recorder, opts, method, req, start, result, err), opts); event != nil {
+		recorder.enqueue(event)
 	}
 }
 
@@ -212,18 +212,18 @@ func buildEvent(
 	method = ClampString(method, maxMethodLength)
 
 	event := &RequestEvent{
-		Type:       "mcp.request",
 		StartTime:  start.UnixMilli(),
-		DurationMs: max(0, time.Since(start).Milliseconds()),
+		DurationMs: time.Since(start).Milliseconds(),
 		Method:     method,
 		Target:     extractTarget(method, params),
 		Client:     extractClient(req),
-		InstanceID: recorder.InstanceID(),
-		Seq:        recorder.NextSeq(),
 	}
 
 	if opts.GetUser != nil {
 		event.User = resolveUser(ctx, req, recorder, opts)
+	}
+	if opts.GetSessionID != nil {
+		event.SessionID = resolveSessionID(ctx, req, recorder, opts)
 	}
 
 	extractHTTPInfo(event, req.GetExtra(), opts)
@@ -240,11 +240,9 @@ func buildEvent(
 		event.AuthHash = hashBearerToken(extra.Header)
 	}
 
-	if !opts.DisableParamCapture {
-		delete(params, "_meta")
-		if len(params) > 0 {
-			event.Params = TruncateValue(params, opts.maxValueLength())
-		}
+	delete(params, "_meta")
+	if len(params) > 0 {
+		event.Params = params
 	}
 
 	if err != nil {
@@ -256,19 +254,13 @@ func buildEvent(
 		}
 	} else if result != nil {
 		value := decodeJSON(result)
-		recorded := &RecordedResult{}
+		recorded := &RecordedResult{Value: value}
 		if m, ok := value.(map[string]any); ok && m["isError"] == true {
 			recorded.IsError = true
-		}
-		if !opts.DisableResultCapture {
-			recorded.Value = TruncateValue(value, opts.maxValueLength())
 		}
 		event.Result = recorded
 	}
 
-	if opts.SanitizeEvent != nil {
-		return opts.SanitizeEvent(event)
-	}
 	return event
 }
 
@@ -279,16 +271,17 @@ func resolveUser(ctx context.Context, req mcp.Request, recorder *Recorder, opts 
 			recorder.reportError(fmt.Errorf("GetUser panicked: %v", p))
 		}
 	}()
-	user = opts.GetUser(ctx, req)
-	if user != nil && user.ID == "" {
-		// Ingest rejects the whole batch for a user without an ID, so drop the
-		// user and let the request sessionize as unidentified instead.
-		recorder.emptyUserIDOnce.Do(func() {
-			recorder.reportError(errors.New("GetUser returned a RecordedUser with an empty ID; ignoring user"))
-		})
-		return nil
-	}
-	return user
+	return opts.GetUser(ctx, req)
+}
+
+func resolveSessionID(ctx context.Context, req mcp.Request, recorder *Recorder, opts Options) (sessionID string) {
+	defer func() {
+		if p := recover(); p != nil {
+			sessionID = ""
+			recorder.reportError(fmt.Errorf("GetSessionID panicked: %v", p))
+		}
+	}()
+	return ClampString(opts.GetSessionID(ctx, req), maxSessionIDLength)
 }
 
 func decodeJSON(value any) any {
@@ -359,40 +352,13 @@ func extractHTTPInfo(event *RequestEvent, extra *mcp.RequestExtra, opts Options)
 	}
 
 	if !opts.DisableHeaderCapture {
-		event.Headers = captureHeaders(header, opts)
-	}
-}
-
-func captureHeaders(header http.Header, opts Options) map[string]string {
-	redacted := make(map[string]bool, len(opts.RedactHeaders))
-	for _, name := range opts.RedactHeaders {
-		redacted[strings.ToLower(name)] = true
-	}
-
-	names := make([]string, 0, len(header))
-	for name := range header {
-		if !strings.EqualFold(name, httpContextHeader) {
-			names = append(names, name)
+		event.Headers = make(map[string]string, len(header))
+		for name, values := range header {
+			if !strings.EqualFold(name, httpContextHeader) {
+				event.Headers[name] = strings.Join(values, ", ")
+			}
 		}
 	}
-	slices.SortFunc(names, func(a, b string) int { return strings.Compare(strings.ToLower(a), strings.ToLower(b)) })
-
-	captured := make(map[string]string, min(len(names), maxCapturedHeaders))
-	for _, name := range names[:min(len(names), maxCapturedHeaders)] {
-		lowered := strings.ToLower(name)
-		value := strings.Join(header[name], ", ")
-		if alwaysRedactedHeaders[lowered] || redacted[lowered] {
-			value = redactedValue
-		} else {
-			value = ClampString(value, maxHeaderValueLength)
-		}
-		captured[ClampString(lowered, maxHeaderNameLength)] = value
-	}
-
-	if len(captured) == 0 {
-		return nil
-	}
-	return captured
 }
 
 // auth.TokenInfo has no client ID field; RFC 9068 access tokens carry it as

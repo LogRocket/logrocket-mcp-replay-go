@@ -94,10 +94,24 @@ func (r *Recorder) NextSeq() int64 {
 	return r.seq
 }
 
-// Enqueue buffers an event, flushing when the buffer reaches MaxBatchSize or
-// scheduling a timer-based flush otherwise.
+// Enqueue records a request handled outside the go-sdk middleware (e.g., by a
+// custom JSON-RPC dispatcher). It applies the recorder's capture, redaction,
+// and SanitizeEvent options, sets Type, InstanceID, and Seq, and drops events
+// without a Method or StartTime. The event is modified in place.
 func (r *Recorder) Enqueue(event *RequestEvent) {
 	if r.appID == "" || event == nil {
+		return
+	}
+
+	if event = r.prepare(event, r.opts); event != nil {
+		r.enqueue(event)
+	}
+}
+
+// enqueue buffers a prepared event, flushing when the buffer reaches
+// MaxBatchSize or scheduling a timer-based flush otherwise.
+func (r *Recorder) enqueue(event *RequestEvent) {
+	if r.appID == "" {
 		return
 	}
 
@@ -155,6 +169,10 @@ func (r *Recorder) Flush() {
 // Shutdown flushes buffered events and waits for all pending uploads to
 // finish, or for ctx to be done, whichever comes first. Call it before your
 // process exits (e.g., with defer in main) so the final batch is not lost.
+//
+// Shutdown is safe to call repeatedly and the recorder keeps working
+// afterwards, so on platforms that freeze the process after each response
+// (e.g., AWS Lambda), call it at the end of every invocation.
 func (r *Recorder) Shutdown(ctx context.Context) error {
 	r.Flush()
 
